@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/g8rswimmer/go-sfdc/session"
-	"github.com/g8rswimmer/go-sfdc/sobject"
+	"github.com/elastic/go-sfdc/session"
+	"github.com/elastic/go-sfdc/sobject"
 )
 
 type mockQuery struct {
