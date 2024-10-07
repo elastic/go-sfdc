@@ -19,12 +19,6 @@ type jwtProvider struct {
 	now   func() time.Time // Function to get the current time, useful for testing
 }
 
-type claims struct {
-	// Reason for using RegisteredClaims instead of StandardClaims
-	// See: https://github.com/golang-jwt/jwt/blob/62e504c2810b67f6b97313424411cfffb25e41b0/MIGRATION_GUIDE.md?plain=1#L81
-	jwt.RegisteredClaims
-}
-
 func (provider *jwtProvider) Retrieve() (io.Reader, error) {
 	expirationTime := provider.GetAppropriateExpirationTime()
 	tokenString, err := provider.BuildClaimsToken(expirationTime, provider.creds.URL, provider.creds.ClientId, provider.creds.ClientUsername)
@@ -51,14 +45,13 @@ func (provider *jwtProvider) GetAppropriateExpirationTime() time.Time {
 }
 
 func (provider *jwtProvider) BuildClaimsToken(expirationTime time.Time, url string, clientId string, clientUsername string) (string, error) {
-	claims := &claims{
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(expirationTime),
-			Audience:  []string{url},
-			Issuer:    clientId,
-			Subject:   clientUsername,
-		},
+	claims := jwt.MapClaims{
+		"iss": clientId,
+		"sub": clientUsername,
+		"aud": url,
+		"exp": expirationTime.Unix(),
 	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 
 	if provider.creds.ClientKey == nil {

@@ -121,7 +121,7 @@ func Test_jwtProvider_Retrieve(t *testing.T) {
 				}
 
 				gotToken := gotForm.Get("assertion")
-				gotClaims := &claims{}
+				gotClaims := &jwt.MapClaims{}
 				_, err = jwt.ParseWithClaims(gotToken, gotClaims, func(token *jwt.Token) (interface{}, error) {
 					if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 						return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -133,16 +133,16 @@ func Test_jwtProvider_Retrieve(t *testing.T) {
 					return
 				}
 
-				wantClaims := &claims{
-					RegisteredClaims: jwt.RegisteredClaims{
-						ExpiresAt: jwt.NewNumericDate(fixedTime().Add(JwtExpiration)),
-						Audience:  []string{provider.creds.URL},
-						Issuer:    provider.creds.ClientId,
-						Subject:   provider.creds.ClientUsername,
-					},
+				wantClaims := jwt.MapClaims{
+					"iss": provider.creds.ClientId,
+					"sub": provider.creds.ClientUsername,
+					"aud": provider.creds.URL,
+					"exp": fixedTime().Add(JwtExpiration).Unix(),
 				}
 
-				if !reflect.DeepEqual(gotClaims, wantClaims) {
+				(*gotClaims)["exp"] = int64((*gotClaims)["exp"].(float64))
+
+				if !reflect.DeepEqual(*gotClaims, wantClaims) {
 					t.Errorf("jwtProvider.Retrieve() claims = %v, want %v", gotClaims, wantClaims)
 				}
 			}
