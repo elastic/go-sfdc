@@ -115,7 +115,6 @@ func TestNewPasswordCredentials(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
 			got, err := NewPasswordCredentials(tt.args.creds)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("NewPasswordCredentials() error = %v, wantErr %v", err, tt.wantErr)

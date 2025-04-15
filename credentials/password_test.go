@@ -18,6 +18,7 @@ func mockPasswordRetriveReader(creds PasswordCredentials) io.Reader {
 
 	return strings.NewReader(form.Encode())
 }
+
 func Test_passwordProvider_Retrieve(t *testing.T) {
 	type fields struct {
 		creds PasswordCredentials

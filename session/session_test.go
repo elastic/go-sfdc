@@ -14,7 +14,6 @@ import (
 )
 
 func TestPasswordSessionRequest(t *testing.T) {
-
 	scenarios := []struct {
 		desc  string
 		creds credentials.PasswordCredentials
@@ -90,7 +89,6 @@ func TestPasswordSessionRequest(t *testing.T) {
 			}
 		}
 	}
-
 }
 
 func TestPasswordSessionResponse(t *testing.T) {
@@ -173,7 +171,6 @@ func TestPasswordSessionResponse(t *testing.T) {
 	for _, scenario := range scenarios {
 
 		request, err := http.NewRequest(http.MethodPost, scenario.url, nil)
-
 		if err != nil {
 			t.Fatal(err.Error())
 		}
@@ -227,6 +224,7 @@ func testNewPasswordCredentials(cred credentials.PasswordCredentials) *credentia
 	}
 	return creds
 }
+
 func TestNewPasswordSession(t *testing.T) {
 	scenarios := []struct {
 		desc    string
@@ -308,7 +306,6 @@ func TestNewPasswordSession(t *testing.T) {
 					ClientSecret: "shhhh its a secret",
 				}),
 				Client: mockHTTPClient(func(req *http.Request) *http.Response {
-
 					return &http.Response{
 						StatusCode: http.StatusInternalServerError,
 						Status:     "Some status",
@@ -445,7 +442,6 @@ func TestSession_AuthorizationHeader(t *testing.T) {
 			if got := tt.args.request.Header.Get("Authorization"); got != tt.want {
 				t.Errorf("Session.AuthorizationHeader() = %v, want %v", got, tt.want)
 			}
-
 		})
 	}
 }
