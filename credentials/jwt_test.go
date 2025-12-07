@@ -43,6 +43,59 @@ func fixedTime() time.Time {
 	return time.Now()
 }
 
+func Test_jwtProvider_URL(t *testing.T) {
+	tests := []struct {
+		name     string
+		creds    JwtCredentials
+		wantURL  string
+	}{
+		{
+			name: "TokenURL provided - should use TokenURL",
+			creds: JwtCredentials{
+				URL:      "https://login.salesforce.com",
+				TokenURL: "https://custom.my.salesforce.com",
+			},
+			wantURL: "https://custom.my.salesforce.com",
+		},
+		{
+			name: "TokenURL empty - should fall back to URL",
+			creds: JwtCredentials{
+				URL:      "https://login.salesforce.com",
+				TokenURL: "",
+			},
+			wantURL: "https://login.salesforce.com",
+		},
+		{
+			name: "TokenURL not set - should fall back to URL",
+			creds: JwtCredentials{
+				URL: "https://test.salesforce.com",
+			},
+			wantURL: "https://test.salesforce.com",
+		},
+		{
+			name: "Government cloud scenario - different token endpoint",
+			creds: JwtCredentials{
+				URL:      "https://login.salesforce.com",
+				TokenURL: "https://login.salesforce.mil",
+			},
+			wantURL: "https://login.salesforce.mil",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &jwtProvider{
+				creds: tt.creds,
+			}
+
+			got := provider.URL()
+			if got != tt.wantURL {
+				t.Errorf("jwtProvider.URL() = %v, want %v", got, tt.wantURL)
+			}
+		})
+	}
+}
+
 func Test_jwtProvider_Retrieve(t *testing.T) {
 	pemData := []byte(SampleKey)
 	signKey, err := jwt.ParseRSAPrivateKeyFromPEM(pemData)

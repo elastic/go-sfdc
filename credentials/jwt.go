@@ -32,9 +32,9 @@ func (provider *jwtProvider) Retrieve() (io.Reader, error) {
 }
 
 // URL returns the endpoint for the token request.
-// If TokenEndpointURL is specified, it will be used; otherwise, falls back to URL.
+// If TokenURL is specified, it will be used; otherwise, falls back to URL.
 func (provider *jwtProvider) URL() string {
-	// Use TokenEndpointURL if provided, otherwise fall back to the original URL (audience)
+	// Use TokenURL if provided, otherwise fall back to the original URL (audience)
 	if provider.creds.TokenURL != "" {
 		return provider.creds.TokenURL
 	}
