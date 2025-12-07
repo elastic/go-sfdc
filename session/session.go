@@ -72,7 +72,6 @@ func Open(config sfdc.Configuration) (*Session, error) {
 		return nil, errors.New("session: configuration version can not be less than zero")
 	}
 	request, err := passwordSessionRequest(config.Credentials)
-
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +90,6 @@ func Open(config sfdc.Configuration) (*Session, error) {
 }
 
 func passwordSessionRequest(creds *credentials.Credentials) (*http.Request, error) {
-
 	oauthURL := creds.URL() + oauthEndpoint
 
 	body, err := creds.Retrieve()
@@ -100,7 +98,6 @@ func passwordSessionRequest(creds *credentials.Credentials) (*http.Request, erro
 	}
 
 	request, err := http.NewRequest(http.MethodPost, oauthURL, body)
-
 	if err != nil {
 		return nil, err
 	}

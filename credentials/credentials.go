@@ -27,10 +27,11 @@ type PasswordCredentials struct {
 }
 
 type JwtCredentials struct {
-	URL				string
-	ClientId 		string // the client id as defined in the connected app in SalesForce
-	ClientUsername 	string
-	ClientKey 		*rsa.PrivateKey  // the client RSA key uploaded for authentication in the ConnectedApp
+	URL            string // Used as the audience URL in the JWT claim
+	TokenURL       string // Optional: The endpoint to send the token request to (if different from URL)
+	ClientId       string // The client id as defined in the connected app in SalesForce
+	ClientUsername string
+	ClientKey      *rsa.PrivateKey // The client RSA key uploaded for authentication in the connected app
 }
 
 // Credentials is the structure that contains all of the
@@ -54,7 +55,7 @@ type grantType string
 
 const (
 	passwordGrantType grantType = "password"
-	jwtGrantType grantType = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+	jwtGrantType      grantType = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 )
 
 // Retrieve will return the reader for the HTTP request body.
@@ -91,7 +92,9 @@ func NewPasswordCredentials(creds PasswordCredentials) (*Credentials, error) {
 
 // NewJWTCredentials weill create a credntial with all required info about generating a JWT claims parameter
 func NewJWTCredentials(creds JwtCredentials) (*Credentials, error) {
-	if err := validateJWTCredentials(creds); err != nil {return nil, err}
+	if err := validateJWTCredentials(creds); err != nil {
+		return nil, err
+	}
 	return &Credentials{
 		provider: &jwtProvider{
 			creds: creds,
@@ -118,14 +121,13 @@ func validatePasswordCredentials(cred PasswordCredentials) error {
 func validateJWTCredentials(cred JwtCredentials) error {
 	switch {
 	case len(cred.URL) == 0:
-		return errors.New("URL cannot be empty")
+		return errors.New("credentials: URL cannot be empty")
 	case cred.ClientKey == nil:
-		return errors.New("client key cannot be empty")
+		return errors.New("credentials: client key cannot be empty")
 	case len(cred.ClientUsername) == 0:
-		return errors.New("client username cannot be empty")
+		return errors.New("credentials: client username cannot be empty")
 	case len(cred.ClientId) == 0:
-		return errors.New("client id cannot be empty")
+		return errors.New("credentials: client id cannot be empty")
 	}
 	return nil
-
 }

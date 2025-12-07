@@ -10,9 +10,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const (
-	JwtExpiration = 3 * time.Minute
-)
+const JwtExpiration = 3 * time.Minute
 
 type jwtProvider struct {
 	creds JwtCredentials
@@ -33,10 +31,17 @@ func (provider *jwtProvider) Retrieve() (io.Reader, error) {
 	return strings.NewReader(form.Encode()), nil
 }
 
+// URL returns the endpoint for the token request.
+// If TokenURL is specified, it will be used; otherwise, falls back to URL.
 func (provider *jwtProvider) URL() string {
+	// Use TokenURL if provided, otherwise fall back to the original URL (audience)
+	if provider.creds.TokenURL != "" {
+		return provider.creds.TokenURL
+	}
 	return provider.creds.URL
 }
 
+// GetAppropriateExpirationTime returns a time value for the JWT expiration.
 func (provider *jwtProvider) GetAppropriateExpirationTime() time.Time {
 	if provider.now != nil {
 		return provider.now().Add(JwtExpiration)
@@ -44,7 +49,8 @@ func (provider *jwtProvider) GetAppropriateExpirationTime() time.Time {
 	return time.Now().Add(JwtExpiration)
 }
 
-func (provider *jwtProvider) BuildClaimsToken(expirationTime time.Time, url string, clientId string, clientUsername string) (string, error) {
+// BuildClaimsToken generates a signed JWT token with the specified claims.
+func (provider *jwtProvider) BuildClaimsToken(expirationTime time.Time, url, clientId, clientUsername string) (string, error) {
 	claims := jwt.MapClaims{
 		"iss": clientId,
 		"sub": clientUsername,
