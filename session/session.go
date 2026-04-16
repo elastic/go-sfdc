@@ -2,10 +2,13 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"sync"
 
 	"github.com/elastic/go-sfdc"
 	"github.com/elastic/go-sfdc/credentials"
@@ -16,6 +19,8 @@ import (
 type Session struct {
 	response *sessionPasswordResponse
 	config   sfdc.Configuration
+	client   *http.Client
+	mu       sync.RWMutex
 }
 
 // Clienter interface provides the HTTP client used by the
@@ -59,6 +64,11 @@ type sessionPasswordResponse struct {
 
 const oauthEndpoint = "/services/oauth2/token"
 
+var invalidAuthErrorCodes = map[string]struct{}{
+	"INVALID_AUTH_HEADER": {},
+	"INVALID_SESSION_ID":  {},
+}
+
 // Open is used to authenticate with Salesforce and open a session.  The user will need to
 // supply the proper credentials and a HTTP client.
 func Open(config sfdc.Configuration) (*Session, error) {
@@ -85,6 +95,7 @@ func Open(config sfdc.Configuration) (*Session, error) {
 		response: response,
 		config:   config,
 	}
+	session.client = newRefreshingClient(config.Client, session)
 
 	return session, nil
 }
@@ -131,23 +142,159 @@ func passwordSessionResponse(request *http.Request, client *http.Client) (*sessi
 // InstanceURL will retuern the Salesforce instance
 // from the session authentication.
 func (session *Session) InstanceURL() string {
+	session.mu.RLock()
+	defer session.mu.RUnlock()
 	return session.response.InstanceURL
 }
 
 // ServiceURL will return the Salesforce instance for the
 // service URL.
 func (session *Session) ServiceURL() string {
+	session.mu.RLock()
+	defer session.mu.RUnlock()
 	return fmt.Sprintf("%s/services/data/v%d.0", session.response.InstanceURL, session.config.Version)
 }
 
 // AuthorizationHeader will add the authorization to the
 // HTTP request's header.
 func (session *Session) AuthorizationHeader(request *http.Request) {
-	auth := fmt.Sprintf("%s %s", session.response.TokenType, session.response.AccessToken)
-	request.Header.Add("Authorization", auth)
+	request.Header.Set("Authorization", session.authorizationValue())
 }
 
 // Client returns the HTTP client to be used in APIs calls.
 func (session *Session) Client() *http.Client {
+	if session.client != nil {
+		return session.client
+	}
 	return session.config.Client
+}
+
+func (session *Session) authorizationValue() string {
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return fmt.Sprintf("%s %s", session.response.TokenType, session.response.AccessToken)
+}
+
+func (session *Session) refresh(failedAuthorization string) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+
+	currentAuthorization := fmt.Sprintf("%s %s", session.response.TokenType, session.response.AccessToken)
+	if failedAuthorization != "" && currentAuthorization != failedAuthorization {
+		return nil
+	}
+
+	request, err := passwordSessionRequest(session.config.Credentials)
+	if err != nil {
+		return err
+	}
+
+	response, err := passwordSessionResponse(request, session.config.Client)
+	if err != nil {
+		return err
+	}
+
+	session.response = response
+	return nil
+}
+
+type salesforceErrorResponse struct {
+	ErrorCode string `json:"errorCode"`
+}
+
+type authRefreshTransport struct {
+	session *Session
+	base    http.RoundTripper
+}
+
+func newRefreshingClient(client *http.Client, session *Session) *http.Client {
+	cloned := *client
+	cloned.Transport = &authRefreshTransport{
+		session: session,
+		base:    transportFor(client),
+	}
+	return &cloned
+}
+
+func transportFor(client *http.Client) http.RoundTripper {
+	if client.Transport != nil {
+		return client.Transport
+	}
+	return http.DefaultTransport
+}
+
+func (transport *authRefreshTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	failedAuthorization := request.Header.Get("Authorization")
+	retryRequest, err := cloneRequestForRetry(request)
+	if err != nil {
+		retryRequest = nil
+	}
+
+	response, err := transport.base.RoundTrip(request)
+	if err != nil || retryRequest == nil {
+		return response, err
+	}
+
+	invalidAuth, err := isInvalidAuthResponse(response)
+	if err != nil || !invalidAuth {
+		return response, err
+	}
+
+	if err := transport.session.refresh(failedAuthorization); err != nil {
+		return response, nil
+	}
+
+	response.Body.Close()
+	transport.session.AuthorizationHeader(retryRequest)
+	return transport.base.RoundTrip(retryRequest)
+}
+
+func isInvalidAuthResponse(response *http.Response) (bool, error) {
+	if response == nil {
+		return false, nil
+	}
+	if response.StatusCode != http.StatusBadRequest && response.StatusCode != http.StatusUnauthorized {
+		return false, nil
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return false, err
+	}
+	response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+
+	var errorResponses []salesforceErrorResponse
+	if err := json.Unmarshal(body, &errorResponses); err != nil {
+		var errorResponse salesforceErrorResponse
+		if err := json.Unmarshal(body, &errorResponse); err != nil {
+			return false, nil
+		}
+		errorResponses = []salesforceErrorResponse{errorResponse}
+	}
+
+	for _, errorResponse := range errorResponses {
+		if _, ok := invalidAuthErrorCodes[errorResponse.ErrorCode]; ok {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func cloneRequestForRetry(request *http.Request) (*http.Request, error) {
+	cloned := request.Clone(request.Context())
+	if request.Body == nil {
+		return cloned, nil
+	}
+	if request.GetBody == nil {
+		return nil, errors.New("session: request body can not be replayed")
+	}
+
+	body, err := request.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	cloned.Body = body
+	return cloned, nil
 }
