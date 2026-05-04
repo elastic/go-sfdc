@@ -3,17 +3,43 @@ package session
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/elastic/go-sfdc"
 	"github.com/elastic/go-sfdc/credentials"
+	"github.com/elastic/go-sfdc/internal/testkeys"
 )
 
-func TestPasswordSessionRequest(t *testing.T) {
+type trackingReadCloser struct {
+	reader io.Reader
+	closed bool
+}
+
+func (body *trackingReadCloser) Read(p []byte) (int, error) {
+	return body.reader.Read(p)
+}
+
+func (body *trackingReadCloser) Close() error {
+	body.closed = true
+	return nil
+}
+
+type errReader struct {
+	err error
+}
+
+func (reader errReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+func TestNewOAuthTokenRequest(t *testing.T) {
 	scenarios := []struct {
 		desc  string
 		creds credentials.PasswordCredentials
@@ -49,7 +75,7 @@ func TestPasswordSessionRequest(t *testing.T) {
 		if err != nil {
 			t.Fatal("password credentials can not return an error for these tests")
 		}
-		request, err := passwordSessionRequest(passwordCreds)
+		request, err := newOAuthTokenRequest(passwordCreds)
 
 		if err != nil && scenario.err == nil {
 			t.Errorf("%s Error was not expected %s", scenario.desc, err.Error())
@@ -91,12 +117,12 @@ func TestPasswordSessionRequest(t *testing.T) {
 	}
 }
 
-func TestPasswordSessionResponse(t *testing.T) {
+func TestExchangeOAuthToken(t *testing.T) {
 	scenarios := []struct {
 		desc     string
 		url      string
 		client   *http.Client
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		err      error
 	}{
 		{
@@ -119,7 +145,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 					Header:     make(http.Header),
 				}
 			}),
-			response: &sessionPasswordResponse{
+			response: &oauthTokenResponse{
 				AccessToken: "token",
 				InstanceURL: "https://some.salesforce.instance.com",
 				ID:          "https://test.salesforce.com/id/123456789",
@@ -140,7 +166,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 					Header:     make(http.Header),
 				}
 			}),
-			response: &sessionPasswordResponse{},
+			response: &oauthTokenResponse{},
 			err:      fmt.Errorf("session response error: %d %s", http.StatusInternalServerError, "Some status"),
 		},
 		{
@@ -163,7 +189,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 					Header:     make(http.Header),
 				}
 			}),
-			response: &sessionPasswordResponse{},
+			response: &oauthTokenResponse{},
 			err:      errors.New("invalid character '}' looking for beginning of object key string"),
 		},
 	}
@@ -175,7 +201,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 			t.Fatal(err.Error())
 		}
 
-		response, err := passwordSessionResponse(request, scenario.client)
+		response, err := exchangeOAuthToken(request, scenario.client)
 
 		if err != nil && scenario.err == nil {
 			t.Errorf("%s Error was not expected %s", scenario.desc, err.Error())
@@ -217,6 +243,161 @@ func TestPasswordSessionResponse(t *testing.T) {
 	}
 }
 
+func TestExchangeOAuthToken_ClosesResponseBodyOnStatusError(t *testing.T) {
+	body := &trackingReadCloser{reader: strings.NewReader(`{"error":"boom"}`)}
+	client := mockHTTPClient(func(req *http.Request) *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Status:     "500 Internal Server Error",
+			Body:       body,
+			Header:     make(http.Header),
+		}
+	})
+
+	request, err := http.NewRequest(http.MethodPost, "http://example.com/foo", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+
+	_, err = exchangeOAuthToken(request, client)
+	if err == nil {
+		t.Fatal("exchangeOAuthToken() error = nil, want non-nil")
+	}
+	if !body.closed {
+		t.Fatal("exchangeOAuthToken() did not close response body on status error")
+	}
+}
+
+func TestAuthRefreshTransport_RoundTripReturnsNilResponseOnInspectionError(t *testing.T) {
+	readErr := errors.New("read failure")
+	body := &trackingReadCloser{reader: errReader{err: readErr}}
+	transport := &authRefreshTransport{
+		session: &Session{},
+		base: roundTripFunc(func(req *http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Status:     "401 Unauthorized",
+				Body:       body,
+				Header:     make(http.Header),
+			}
+		}),
+	}
+
+	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+	request.Header.Set("Authorization", "Bearer expired")
+
+	response, err := transport.RoundTrip(request)
+	if err == nil {
+		t.Fatal("RoundTrip() error = nil, want non-nil")
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("RoundTrip() error = %v, want %v", err, readErr)
+	}
+	if response != nil {
+		t.Fatalf("RoundTrip() response = %#v, want nil", response)
+	}
+	if !body.closed {
+		t.Fatal("RoundTrip() did not close response body on inspection error")
+	}
+}
+
+func TestSessionRefresh_DoesNotBlockAuthorizationHeader(t *testing.T) {
+	passwordCreds, err := credentials.NewPasswordCredentials(credentials.PasswordCredentials{
+		URL:          "https://login.salesforce.example.com",
+		Username:     "myusername",
+		Password:     "12345",
+		ClientID:     "some client id",
+		ClientSecret: "shhhh its a secret",
+	})
+	if err != nil {
+		t.Fatalf("credentials.NewPasswordCredentials() error = %v, want nil", err)
+	}
+
+	authStarted := make(chan struct{})
+	releaseAuth := make(chan struct{})
+	refreshDone := make(chan error, 1)
+	client := mockHTTPClient(func(req *http.Request) *http.Response {
+		if req.URL.Path != oauthEndpoint {
+			t.Fatalf("unexpected request path %q", req.URL.Path)
+		}
+		close(authStarted)
+		<-releaseAuth
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: ioutil.NopCloser(strings.NewReader(`{
+				"access_token": "refreshed",
+				"instance_url": "https://instance.salesforce.example.com",
+				"id": "https://test.salesforce.com/id/123456789",
+				"token_type": "Bearer",
+				"issued_at": "1553568410028",
+				"signature": "hello"
+			}`)),
+			Header: make(http.Header),
+		}
+	})
+
+	session := &Session{
+		response: &oauthTokenResponse{
+			AccessToken: "expired",
+			InstanceURL: "https://instance.salesforce.example.com",
+			ID:          "https://test.salesforce.com/id/123456789",
+			TokenType:   "Bearer",
+			IssuedAt:    "1553568410028",
+			Signature:   "hello",
+		},
+		config: sfdc.Configuration{
+			Credentials: passwordCreds,
+			Client:      client,
+			Version:     45,
+		},
+	}
+
+	go func() {
+		refreshDone <- session.refresh("Bearer expired")
+	}()
+
+	<-authStarted
+
+	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+
+	authHeaderDone := make(chan struct{})
+	go func() {
+		session.AuthorizationHeader(request)
+		close(authHeaderDone)
+	}()
+
+	select {
+	case <-authHeaderDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("AuthorizationHeader blocked while refresh was in flight")
+	}
+
+	if got, want := request.Header.Get("Authorization"), "Bearer expired"; got != want {
+		t.Fatalf("AuthorizationHeader() = %q, want %q while refresh is in flight", got, want)
+	}
+
+	close(releaseAuth)
+
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refresh() error = %v, want nil", err)
+	}
+
+	nextRequest, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+	session.AuthorizationHeader(nextRequest)
+	if got, want := nextRequest.Header.Get("Authorization"), "Bearer refreshed"; got != want {
+		t.Fatalf("AuthorizationHeader() = %q, want %q after refresh completes", got, want)
+	}
+}
+
 func testNewPasswordCredentials(cred credentials.PasswordCredentials) *credentials.Credentials {
 	creds, err := credentials.NewPasswordCredentials(cred)
 	if err != nil {
@@ -225,7 +406,7 @@ func testNewPasswordCredentials(cred credentials.PasswordCredentials) *credentia
 	return creds
 }
 
-func TestNewPasswordSession(t *testing.T) {
+func TestOpen(t *testing.T) {
 	scenarios := []struct {
 		desc    string
 		config  sfdc.Configuration
@@ -262,7 +443,7 @@ func TestNewPasswordSession(t *testing.T) {
 				Version: 45,
 			},
 			session: &Session{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					AccessToken: "token",
 					InstanceURL: "https://some.salesforce.instance.com",
 					ID:          "https://test.salesforce.com/id/123456789",
@@ -366,7 +547,7 @@ func TestNewPasswordSession(t *testing.T) {
 
 func TestSession_ServiceURL(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	tests := []struct {
@@ -377,7 +558,7 @@ func TestSession_ServiceURL(t *testing.T) {
 		{
 			name: "Passing URL",
 			fields: fields{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					InstanceURL: "https://www.my.salesforce.instance",
 				},
 				config: sfdc.Configuration{
@@ -402,7 +583,7 @@ func TestSession_ServiceURL(t *testing.T) {
 
 func TestSession_AuthorizationHeader(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	type args struct {
@@ -417,7 +598,7 @@ func TestSession_AuthorizationHeader(t *testing.T) {
 		{
 			name: "Authorization Test",
 			fields: fields{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					TokenType:   "Type",
 					AccessToken: "Access",
 				},
@@ -448,7 +629,7 @@ func TestSession_AuthorizationHeader(t *testing.T) {
 
 func TestSession_Client(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	tests := []struct {
@@ -459,7 +640,7 @@ func TestSession_Client(t *testing.T) {
 		{
 			name: "Session Client",
 			fields: fields{
-				response: &sessionPasswordResponse{},
+				response: &oauthTokenResponse{},
 				config: sfdc.Configuration{
 					Client: http.DefaultClient,
 				},
@@ -482,7 +663,7 @@ func TestSession_Client(t *testing.T) {
 
 func TestSession_InstanceURL(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	tests := []struct {
@@ -493,7 +674,7 @@ func TestSession_InstanceURL(t *testing.T) {
 		{
 			name: "Passing URL",
 			fields: fields{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					InstanceURL: "https://www.my.salesforce.instance",
 				},
 				config: sfdc.Configuration{
@@ -513,5 +694,252 @@ func TestSession_InstanceURL(t *testing.T) {
 				t.Errorf("Session.InstanceURL() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSession_ClientReauthenticatesAfterInvalidAuthErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		status     string
+		errorCode  string
+	}{
+		{
+			name:       "invalid auth header",
+			statusCode: http.StatusBadRequest,
+			status:     "400 Bad Request",
+			errorCode:  "INVALID_AUTH_HEADER",
+		},
+		{
+			name:       "invalid session id",
+			statusCode: http.StatusUnauthorized,
+			status:     "401 Unauthorized",
+			errorCode:  "INVALID_SESSION_ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			passwordCreds, err := credentials.NewPasswordCredentials(credentials.PasswordCredentials{
+				URL:          "https://login.salesforce.example.com",
+				Username:     "myusername",
+				Password:     "12345",
+				ClientID:     "some client id",
+				ClientSecret: "shhhh its a secret",
+			})
+			if err != nil {
+				t.Fatalf("credentials.NewPasswordCredentials() error = %v, want nil", err)
+			}
+
+			authCalls := 0
+			resourceCalls := 0
+			var authHeaders []string
+
+			client := mockHTTPClient(func(req *http.Request) *http.Response {
+				switch req.URL.Path {
+				case oauthEndpoint:
+					authCalls++
+					token := "expired"
+					if authCalls > 1 {
+						token = "refreshed"
+					}
+
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`{
+							"access_token": %q,
+							"instance_url": "https://instance.salesforce.example.com",
+							"id": "https://test.salesforce.com/id/123456789",
+							"token_type": "Bearer",
+							"issued_at": "1553568410028",
+							"signature": "hello"
+						}`, token))),
+						Header: make(http.Header),
+					}
+				case "/resource":
+					resourceCalls++
+					authHeaders = append(authHeaders, req.Header.Get("Authorization"))
+					if resourceCalls == 1 {
+						return &http.Response{
+							StatusCode: tt.statusCode,
+							Status:     tt.status,
+							Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`[{
+								"message": "Session expired or invalid",
+								"errorCode": %q
+							}]`, tt.errorCode))),
+							Header: make(http.Header),
+						}
+					}
+
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Body:       ioutil.NopCloser(strings.NewReader(`{}`)),
+						Header:     make(http.Header),
+					}
+				default:
+					t.Fatalf("unexpected request path %q", req.URL.Path)
+					return nil
+				}
+			})
+
+			session, err := Open(sfdc.Configuration{
+				Credentials: passwordCreds,
+				Client:      client,
+				Version:     45,
+			})
+			if err != nil {
+				t.Fatalf("Open() error = %v, want nil", err)
+			}
+
+			request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest() error = %v, want nil", err)
+			}
+			session.AuthorizationHeader(request)
+
+			response, err := session.Client().Do(request)
+			if err != nil {
+				t.Fatalf("Session.Client().Do() error = %v, want nil", err)
+			}
+			defer response.Body.Close()
+
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("Session.Client().Do() status = %d, want %d", response.StatusCode, http.StatusOK)
+			}
+			if authCalls != 2 {
+				t.Fatalf("auth calls = %d, want 2", authCalls)
+			}
+			if resourceCalls != 2 {
+				t.Fatalf("resource calls = %d, want 2", resourceCalls)
+			}
+			if !reflect.DeepEqual(authHeaders, []string{"Bearer expired", "Bearer refreshed"}) {
+				t.Fatalf("authorization headers = %v, want %v", authHeaders, []string{"Bearer expired", "Bearer refreshed"})
+			}
+
+			nextRequest, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest() error = %v, want nil", err)
+			}
+			session.AuthorizationHeader(nextRequest)
+			if got, want := nextRequest.Header.Get("Authorization"), "Bearer refreshed"; got != want {
+				t.Fatalf("Session.AuthorizationHeader() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestSession_ClientReauthenticatesWithJWTCredentials(t *testing.T) {
+	jwtCreds, err := credentials.NewJWTCredentials(credentials.JwtCredentials{
+		URL:            "https://login.salesforce.example.com",
+		ClientId:       "some client id",
+		ClientUsername: "myusername",
+		ClientKey:      testkeys.MustParseRSAPrivateKey(t),
+	})
+	if err != nil {
+		t.Fatalf("credentials.NewJWTCredentials() error = %v, want nil", err)
+	}
+
+	authCalls := 0
+	resourceCalls := 0
+	var authGrantTypes []string
+	var authHeaders []string
+
+	client := mockHTTPClient(func(req *http.Request) *http.Response {
+		switch req.URL.Path {
+		case oauthEndpoint:
+			authCalls++
+			body, err := ioutil.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(token request body) error = %v, want nil", err)
+			}
+			values, err := url.ParseQuery(string(body))
+			if err != nil {
+				t.Fatalf("ParseQuery(token request body) error = %v, want nil", err)
+			}
+			authGrantTypes = append(authGrantTypes, values.Get("grant_type"))
+			if values.Get("assertion") == "" {
+				t.Fatal("JWT token request assertion is empty")
+			}
+
+			token := "expired"
+			if authCalls > 1 {
+				token = "refreshed"
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`{
+					"access_token": %q,
+					"instance_url": "https://instance.salesforce.example.com",
+					"id": "https://test.salesforce.com/id/123456789",
+					"token_type": "Bearer",
+					"issued_at": "1553568410028",
+					"signature": "hello"
+				}`, token))),
+				Header: make(http.Header),
+			}
+		case "/resource":
+			resourceCalls++
+			authHeaders = append(authHeaders, req.Header.Get("Authorization"))
+			if resourceCalls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Status:     "401 Unauthorized",
+					Body: ioutil.NopCloser(strings.NewReader(`[{
+						"message": "Session expired or invalid",
+						"errorCode": "INVALID_SESSION_ID"
+					}]`)),
+					Header: make(http.Header),
+				}
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       ioutil.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}
+		default:
+			t.Fatalf("unexpected request path %q", req.URL.Path)
+			return nil
+		}
+	})
+
+	session, err := Open(sfdc.Configuration{
+		Credentials: jwtCreds,
+		Client:      client,
+		Version:     45,
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v, want nil", err)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+	session.AuthorizationHeader(request)
+
+	response, err := session.Client().Do(request)
+	if err != nil {
+		t.Fatalf("Session.Client().Do() error = %v, want nil", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("Session.Client().Do() status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if authCalls != 2 {
+		t.Fatalf("auth calls = %d, want 2", authCalls)
+	}
+	if !reflect.DeepEqual(authGrantTypes, []string{"urn:ietf:params:oauth:grant-type:jwt-bearer", "urn:ietf:params:oauth:grant-type:jwt-bearer"}) {
+		t.Fatalf("auth grant types = %v, want JWT bearer grant twice", authGrantTypes)
+	}
+	if resourceCalls != 2 {
+		t.Fatalf("resource calls = %d, want 2", resourceCalls)
+	}
+	if !reflect.DeepEqual(authHeaders, []string{"Bearer expired", "Bearer refreshed"}) {
+		t.Fatalf("authorization headers = %v, want %v", authHeaders, []string{"Bearer expired", "Bearer refreshed"})
 	}
 }

@@ -56,7 +56,7 @@ type Resource struct {
 	session session.ServiceFormatter
 }
 
-// NewResource creates a new resourse with the session.  If the session is
+// NewResource creates a new resource with the session.  If the session is
 // nil an error will be returned.
 func NewResource(session session.ServiceFormatter) (*Resource, error) {
 	if session == nil {

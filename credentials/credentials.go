@@ -78,7 +78,7 @@ func NewCredentials(provider Provider) (*Credentials, error) {
 	}, nil
 }
 
-// NewPasswordCredentials will create a crendential with the password credentials.
+// NewPasswordCredentials will create a credential with the password credentials.
 func NewPasswordCredentials(creds PasswordCredentials) (*Credentials, error) {
 	if err := validatePasswordCredentials(creds); err != nil {
 		return nil, err
@@ -90,7 +90,7 @@ func NewPasswordCredentials(creds PasswordCredentials) (*Credentials, error) {
 	}, nil
 }
 
-// NewJWTCredentials weill create a credntial with all required info about generating a JWT claims parameter
+// NewJWTCredentials will create credentials with all required info about generating a JWT claims parameter.
 func NewJWTCredentials(creds JwtCredentials) (*Credentials, error) {
 	if err := validateJWTCredentials(creds); err != nil {
 		return nil, err

@@ -53,7 +53,7 @@ func NewResource(session session.ServiceFormatter) (*Resource, error) {
 // Insert will call the composite tree API.
 func (r *Resource) Insert(inserter Inserter) (*Value, error) {
 	if inserter == nil {
-		return nil, errors.New("tree resourse: inserter can not be nil")
+		return nil, errors.New("tree resource: inserter can not be nil")
 	}
 	sobject := inserter.SObject()
 	matching, err := regexp.MatchString(`\w`, sobject)
@@ -61,7 +61,7 @@ func (r *Resource) Insert(inserter Inserter) (*Value, error) {
 		return nil, err
 	}
 	if matching == false {
-		return nil, fmt.Errorf("tree resourse: %s is not a valid sobject", sobject)
+		return nil, fmt.Errorf("tree resource: %s is not a valid sobject", sobject)
 	}
 
 	return r.callout(inserter)
