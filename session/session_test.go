@@ -5,15 +5,45 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/elastic/go-sfdc"
 	"github.com/elastic/go-sfdc/credentials"
+	"github.com/golang-jwt/jwt/v5"
 )
 
-func TestPasswordSessionRequest(t *testing.T) {
+const jwtTestPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAwCPdYprMz3AMh4CwK8fPdArUL63RMVYoXXYfzFdluW5XYE5m
+0a5PuNpMoc33i7+JYGOCS1T+ZhoAM2AHO3/BbC2sB5qNNj48ToR7RADgy+pKyaUa
+iks4hWXI2fqzAZR11xFEMkCKl0S7Zn4t/oZkFlXbgI+fxt+ab8+9rXa770pL7yCO
+lh5HLIQ1VUPWJN7JeBiKfSnBowGLuelQ8ot7YJmEhohBUN++5ZrfSqPedeLlDYPV
+ZLYlEaZE6Xtg0lI+prsJ6wiv0IlTwH7yYECc2XE8MjyWAlNEoObK6kbfD0oIQqU1
+oSXkRCp21MHoJ9ZTFJvd+2GArbYTzz0KL/r7TQIDAQABAoIBAQCfXmAnhIyy1pad
+4gC+H5qT/tNmxL6KNJOAihTv8eH/P2WcDQu9id64TeFYKDXWpUU2PPN6toHYgGKA
+OntlP59Ysj1JhUjxoAd3fO2dRzkuCiSEQrzTznaQNw+0tfu6KMDhZYHySJRryefC
+qJBP2Hq2B/rsFLULSLaZXW9PrPdPDxijnq+Mnok8t+1F1LRkhdXAiTAAryLT7V4I
+eK6uMd0bHK776dQy7A0hR55B5NOW/1U5iYHhNMNCw31Tct9Ula5Dt5U+oe69xMd5
+tog7UaESglsovusN65GpXjwsBUN/a4qYXXUEa3ZWhDsuH3b2ekcMRgfsx5QLSDqH
+5nFtX3kFAoGBAPLa4oBmLerzZ68GMU+uKQscN/C8o671UTS7jCbtWcBMUZOGrN3q
++smpB0YB9W4kALSxYM4LsTQ4n8qkfJz1vlMu6iATcPnG+KlEhVITUHXB/ek5aWfZ
+N1uZDGUlg0sgWSlubnNs5xl6J8tYGRrk84g5i6QCSYxesoJ+M/1P7yozAoGBAMqK
+P/PYkbJWq/gh3KcrbbiQhjz6EoPlypcjBzdfQnPamJ94voh2YYNETlDXTSr5bATP
++dooSaw6lkoDIzZg9IZrq9FDOwXjHptpakpIkYKXKxLVcBl6PrD/hv7jznawdLrP
+yWr9nkqIVHvJxMGvjg7ONgJhCuCHmecrO50p4sR/AoGAa/8aqq7FzK3hddvzIdP5
+PI+X8N5yi+Nb8W9VrBnwx6sou8owJZ/RVsxsB53nXstz5ObcfcSFUQu9Q4hSQhqm
+QKekRg9fNjRdcCiggRdFuJhEKer2DNBz5a/x6yj7cfU4sUwCoiHTw2inOa47u9IE
+2pd8mbrKqjmSeKVWyVc6rDECgYAlrp0BYByTQn7SNnKYA4NxYCopdBk3wuvzPIge
+LDHv3g6hNNS2DNhNlMrBTZ1EzozjRFJm3TH/whKuCHFnr5gu3h9kWo7DpKLQJUeq
+NGAmHLvd0CoAA3dgdNoH2BhUirXc/8WoizEFCuI0+bAKnP/gD0uLG8TrSy8+DBQW
+RHG1PwKBgBAsnnjH4KplKrzfMycTczHEM1pll/wWBe38TbA7YjrOYLGJkac0UVVQ
+Gqhoj3JfpSlWoUbMrOlyY7FlIptmj71P+xPNThKTcc42KMzYJCPhdMllXWktwWKo
+hQZsXUbv/2dzOsyQZWcWM/k+kVArS4+Q3eStBNxaDl0aNQC9CUUg
+-----END RSA PRIVATE KEY-----`
+
+func TestNewOAuthTokenRequest(t *testing.T) {
 	scenarios := []struct {
 		desc  string
 		creds credentials.PasswordCredentials
@@ -49,7 +79,7 @@ func TestPasswordSessionRequest(t *testing.T) {
 		if err != nil {
 			t.Fatal("password credentials can not return an error for these tests")
 		}
-		request, err := passwordSessionRequest(passwordCreds)
+		request, err := newOAuthTokenRequest(passwordCreds)
 
 		if err != nil && scenario.err == nil {
 			t.Errorf("%s Error was not expected %s", scenario.desc, err.Error())
@@ -91,12 +121,12 @@ func TestPasswordSessionRequest(t *testing.T) {
 	}
 }
 
-func TestPasswordSessionResponse(t *testing.T) {
+func TestExchangeOAuthToken(t *testing.T) {
 	scenarios := []struct {
 		desc     string
 		url      string
 		client   *http.Client
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		err      error
 	}{
 		{
@@ -119,7 +149,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 					Header:     make(http.Header),
 				}
 			}),
-			response: &sessionPasswordResponse{
+			response: &oauthTokenResponse{
 				AccessToken: "token",
 				InstanceURL: "https://some.salesforce.instance.com",
 				ID:          "https://test.salesforce.com/id/123456789",
@@ -140,7 +170,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 					Header:     make(http.Header),
 				}
 			}),
-			response: &sessionPasswordResponse{},
+			response: &oauthTokenResponse{},
 			err:      fmt.Errorf("session response error: %d %s", http.StatusInternalServerError, "Some status"),
 		},
 		{
@@ -163,7 +193,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 					Header:     make(http.Header),
 				}
 			}),
-			response: &sessionPasswordResponse{},
+			response: &oauthTokenResponse{},
 			err:      errors.New("invalid character '}' looking for beginning of object key string"),
 		},
 	}
@@ -175,7 +205,7 @@ func TestPasswordSessionResponse(t *testing.T) {
 			t.Fatal(err.Error())
 		}
 
-		response, err := passwordSessionResponse(request, scenario.client)
+		response, err := exchangeOAuthToken(request, scenario.client)
 
 		if err != nil && scenario.err == nil {
 			t.Errorf("%s Error was not expected %s", scenario.desc, err.Error())
@@ -225,7 +255,7 @@ func testNewPasswordCredentials(cred credentials.PasswordCredentials) *credentia
 	return creds
 }
 
-func TestNewPasswordSession(t *testing.T) {
+func TestOpen(t *testing.T) {
 	scenarios := []struct {
 		desc    string
 		config  sfdc.Configuration
@@ -262,7 +292,7 @@ func TestNewPasswordSession(t *testing.T) {
 				Version: 45,
 			},
 			session: &Session{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					AccessToken: "token",
 					InstanceURL: "https://some.salesforce.instance.com",
 					ID:          "https://test.salesforce.com/id/123456789",
@@ -366,7 +396,7 @@ func TestNewPasswordSession(t *testing.T) {
 
 func TestSession_ServiceURL(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	tests := []struct {
@@ -377,7 +407,7 @@ func TestSession_ServiceURL(t *testing.T) {
 		{
 			name: "Passing URL",
 			fields: fields{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					InstanceURL: "https://www.my.salesforce.instance",
 				},
 				config: sfdc.Configuration{
@@ -402,7 +432,7 @@ func TestSession_ServiceURL(t *testing.T) {
 
 func TestSession_AuthorizationHeader(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	type args struct {
@@ -417,7 +447,7 @@ func TestSession_AuthorizationHeader(t *testing.T) {
 		{
 			name: "Authorization Test",
 			fields: fields{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					TokenType:   "Type",
 					AccessToken: "Access",
 				},
@@ -448,7 +478,7 @@ func TestSession_AuthorizationHeader(t *testing.T) {
 
 func TestSession_Client(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	tests := []struct {
@@ -459,7 +489,7 @@ func TestSession_Client(t *testing.T) {
 		{
 			name: "Session Client",
 			fields: fields{
-				response: &sessionPasswordResponse{},
+				response: &oauthTokenResponse{},
 				config: sfdc.Configuration{
 					Client: http.DefaultClient,
 				},
@@ -482,7 +512,7 @@ func TestSession_Client(t *testing.T) {
 
 func TestSession_InstanceURL(t *testing.T) {
 	type fields struct {
-		response *sessionPasswordResponse
+		response *oauthTokenResponse
 		config   sfdc.Configuration
 	}
 	tests := []struct {
@@ -493,7 +523,7 @@ func TestSession_InstanceURL(t *testing.T) {
 		{
 			name: "Passing URL",
 			fields: fields{
-				response: &sessionPasswordResponse{
+				response: &oauthTokenResponse{
 					InstanceURL: "https://www.my.salesforce.instance",
 				},
 				config: sfdc.Configuration{
@@ -645,5 +675,125 @@ func TestSession_ClientReauthenticatesAfterInvalidAuthErrors(t *testing.T) {
 				t.Fatalf("Session.AuthorizationHeader() = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestSession_ClientReauthenticatesWithJWTCredentials(t *testing.T) {
+	signKey, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(jwtTestPrivateKey))
+	if err != nil {
+		t.Fatalf("jwt.ParseRSAPrivateKeyFromPEM() error = %v, want nil", err)
+	}
+
+	jwtCreds, err := credentials.NewJWTCredentials(credentials.JwtCredentials{
+		URL:            "https://login.salesforce.example.com",
+		ClientId:       "some client id",
+		ClientUsername: "myusername",
+		ClientKey:      signKey,
+	})
+	if err != nil {
+		t.Fatalf("credentials.NewJWTCredentials() error = %v, want nil", err)
+	}
+
+	authCalls := 0
+	resourceCalls := 0
+	var authGrantTypes []string
+	var authHeaders []string
+
+	client := mockHTTPClient(func(req *http.Request) *http.Response {
+		switch req.URL.Path {
+		case oauthEndpoint:
+			authCalls++
+			body, err := ioutil.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(token request body) error = %v, want nil", err)
+			}
+			values, err := url.ParseQuery(string(body))
+			if err != nil {
+				t.Fatalf("ParseQuery(token request body) error = %v, want nil", err)
+			}
+			authGrantTypes = append(authGrantTypes, values.Get("grant_type"))
+			if values.Get("assertion") == "" {
+				t.Fatal("JWT token request assertion is empty")
+			}
+
+			token := "expired"
+			if authCalls > 1 {
+				token = "refreshed"
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`{
+					"access_token": %q,
+					"instance_url": "https://instance.salesforce.example.com",
+					"id": "https://test.salesforce.com/id/123456789",
+					"token_type": "Bearer",
+					"issued_at": "1553568410028",
+					"signature": "hello"
+				}`, token))),
+				Header: make(http.Header),
+			}
+		case "/resource":
+			resourceCalls++
+			authHeaders = append(authHeaders, req.Header.Get("Authorization"))
+			if resourceCalls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusUnauthorized,
+					Status:     "401 Unauthorized",
+					Body: ioutil.NopCloser(strings.NewReader(`[{
+						"message": "Session expired or invalid",
+						"errorCode": "INVALID_SESSION_ID"
+					}]`)),
+					Header: make(http.Header),
+				}
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       ioutil.NopCloser(strings.NewReader(`{}`)),
+				Header:     make(http.Header),
+			}
+		default:
+			t.Fatalf("unexpected request path %q", req.URL.Path)
+			return nil
+		}
+	})
+
+	session, err := Open(sfdc.Configuration{
+		Credentials: jwtCreds,
+		Client:      client,
+		Version:     45,
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v, want nil", err)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+	session.AuthorizationHeader(request)
+
+	response, err := session.Client().Do(request)
+	if err != nil {
+		t.Fatalf("Session.Client().Do() error = %v, want nil", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("Session.Client().Do() status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+	if authCalls != 2 {
+		t.Fatalf("auth calls = %d, want 2", authCalls)
+	}
+	if !reflect.DeepEqual(authGrantTypes, []string{"urn:ietf:params:oauth:grant-type:jwt-bearer", "urn:ietf:params:oauth:grant-type:jwt-bearer"}) {
+		t.Fatalf("auth grant types = %v, want JWT bearer grant twice", authGrantTypes)
+	}
+	if resourceCalls != 2 {
+		t.Fatalf("resource calls = %d, want 2", resourceCalls)
+	}
+	if !reflect.DeepEqual(authHeaders, []string{"Bearer expired", "Bearer refreshed"}) {
+		t.Fatalf("authorization headers = %v, want %v", authHeaders, []string{"Bearer expired", "Bearer refreshed"})
 	}
 }

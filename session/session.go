@@ -1,4 +1,4 @@
-// Package session provides handles creation of a Salesforce session
+// Package session handles creation of a Salesforce session.
 package session
 
 import (
@@ -14,10 +14,10 @@ import (
 	"github.com/elastic/go-sfdc/credentials"
 )
 
-// Session is the authentication response.  This is used to generate the
-// authroization header for the Salesforce API calls.
+// Session is the authentication response. This is used to generate the
+// authorization header for the Salesforce API calls.
 type Session struct {
-	response *sessionPasswordResponse
+	response *oauthTokenResponse
 	config   sfdc.Configuration
 	client   *http.Client
 	mu       sync.RWMutex
@@ -30,7 +30,7 @@ type Clienter interface {
 }
 
 // InstanceFormatter is the session interface that
-// formaters the session instance information used
+// formats the session instance information used
 // by the resources.
 //
 // InstanceURL will return the Salesforce instance.
@@ -47,13 +47,15 @@ type InstanceFormatter interface {
 // formats the session for service resources.
 //
 // ServiceURL provides the service URL for resources to
-// user.
+// use.
 type ServiceFormatter interface {
 	InstanceFormatter
 	ServiceURL() string
 }
 
-type sessionPasswordResponse struct {
+// oauthTokenResponse is the JSON body from POST /services/oauth2/token for
+// standard OAuth grants (e.g. password, JWT bearer), not password-only.
+type oauthTokenResponse struct {
 	AccessToken string `json:"access_token"`
 	InstanceURL string `json:"instance_url"`
 	ID          string `json:"id"`
@@ -69,11 +71,15 @@ var invalidAuthErrorCodes = map[string]struct{}{
 	"INVALID_SESSION_ID":  {},
 }
 
-// Open is used to authenticate with Salesforce and open a session.  The user will need to
+// Open is used to authenticate with Salesforce and open a session. The user will need to
 // supply the proper credentials and a HTTP client.
+//
+// The returned session's Client wraps the configured HTTP client. Requests made
+// through Session.Client() are retried once after a Salesforce-shaped expired
+// authentication response, using the same credential provider to get a new token.
 func Open(config sfdc.Configuration) (*Session, error) {
 	if config.Credentials == nil {
-		return nil, errors.New("session: configuration crendentials can not be nil")
+		return nil, errors.New("session: configuration credentials can not be nil")
 	}
 	if config.Client == nil {
 		return nil, errors.New("session: configuration client can not be nil")
@@ -81,12 +87,12 @@ func Open(config sfdc.Configuration) (*Session, error) {
 	if config.Version <= 0 {
 		return nil, errors.New("session: configuration version can not be less than zero")
 	}
-	request, err := passwordSessionRequest(config.Credentials)
+	request, err := newOAuthTokenRequest(config.Credentials)
 	if err != nil {
 		return nil, err
 	}
 
-	response, err := passwordSessionResponse(request, config.Client)
+	response, err := exchangeOAuthToken(request, config.Client)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +106,9 @@ func Open(config sfdc.Configuration) (*Session, error) {
 	return session, nil
 }
 
-func passwordSessionRequest(creds *credentials.Credentials) (*http.Request, error) {
+// newOAuthTokenRequest builds the token POST for any credentials.Provider
+// (password grant, JWT bearer, or a custom provider).
+func newOAuthTokenRequest(creds *credentials.Credentials) (*http.Request, error) {
 	oauthURL := creds.URL() + oauthEndpoint
 
 	body, err := creds.Retrieve()
@@ -118,7 +126,7 @@ func passwordSessionRequest(creds *credentials.Credentials) (*http.Request, erro
 	return request, nil
 }
 
-func passwordSessionResponse(request *http.Request, client *http.Client) (*sessionPasswordResponse, error) {
+func exchangeOAuthToken(request *http.Request, client *http.Client) (*oauthTokenResponse, error) {
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -130,16 +138,16 @@ func passwordSessionResponse(request *http.Request, client *http.Client) (*sessi
 	decoder := json.NewDecoder(response.Body)
 	defer response.Body.Close()
 
-	var sessionResponse sessionPasswordResponse
-	err = decoder.Decode(&sessionResponse)
+	var token oauthTokenResponse
+	err = decoder.Decode(&token)
 	if err != nil {
 		return nil, err
 	}
 
-	return &sessionResponse, nil
+	return &token, nil
 }
 
-// InstanceURL will retuern the Salesforce instance
+// InstanceURL will return the Salesforce instance
 // from the session authentication.
 func (session *Session) InstanceURL() string {
 	session.mu.RLock()
@@ -161,7 +169,8 @@ func (session *Session) AuthorizationHeader(request *http.Request) {
 	request.Header.Set("Authorization", session.authorizationValue())
 }
 
-// Client returns the HTTP client to be used in APIs calls.
+// Client returns the HTTP client to be used in API calls. The client retries
+// once after Salesforce returns a JSON auth error for an expired session.
 func (session *Session) Client() *http.Client {
 	if session.client != nil {
 		return session.client
@@ -184,12 +193,12 @@ func (session *Session) refresh(failedAuthorization string) error {
 		return nil
 	}
 
-	request, err := passwordSessionRequest(session.config.Credentials)
+	request, err := newOAuthTokenRequest(session.config.Credentials)
 	if err != nil {
 		return err
 	}
 
-	response, err := passwordSessionResponse(request, session.config.Client)
+	response, err := exchangeOAuthToken(request, session.config.Client)
 	if err != nil {
 		return err
 	}

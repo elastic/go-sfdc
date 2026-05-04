@@ -483,10 +483,10 @@ func TestQueryResult_NextReauthenticatesAfterInvalidSessionID(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusUnauthorized,
 					Status:     "401 Unauthorized",
-					Body: io.NopCloser(strings.NewReader(`{
+					Body: io.NopCloser(strings.NewReader(`[{
 						"message": "Session expired or invalid",
 						"errorCode": "INVALID_SESSION_ID"
-					}`)),
+					}]`)),
 					Header: make(http.Header),
 				}
 			}
