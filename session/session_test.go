@@ -3,45 +3,41 @@ package session
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/elastic/go-sfdc"
 	"github.com/elastic/go-sfdc/credentials"
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/elastic/go-sfdc/internal/testkeys"
 )
 
-const jwtTestPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
-MIIEowIBAAKCAQEAwCPdYprMz3AMh4CwK8fPdArUL63RMVYoXXYfzFdluW5XYE5m
-0a5PuNpMoc33i7+JYGOCS1T+ZhoAM2AHO3/BbC2sB5qNNj48ToR7RADgy+pKyaUa
-iks4hWXI2fqzAZR11xFEMkCKl0S7Zn4t/oZkFlXbgI+fxt+ab8+9rXa770pL7yCO
-lh5HLIQ1VUPWJN7JeBiKfSnBowGLuelQ8ot7YJmEhohBUN++5ZrfSqPedeLlDYPV
-ZLYlEaZE6Xtg0lI+prsJ6wiv0IlTwH7yYECc2XE8MjyWAlNEoObK6kbfD0oIQqU1
-oSXkRCp21MHoJ9ZTFJvd+2GArbYTzz0KL/r7TQIDAQABAoIBAQCfXmAnhIyy1pad
-4gC+H5qT/tNmxL6KNJOAihTv8eH/P2WcDQu9id64TeFYKDXWpUU2PPN6toHYgGKA
-OntlP59Ysj1JhUjxoAd3fO2dRzkuCiSEQrzTznaQNw+0tfu6KMDhZYHySJRryefC
-qJBP2Hq2B/rsFLULSLaZXW9PrPdPDxijnq+Mnok8t+1F1LRkhdXAiTAAryLT7V4I
-eK6uMd0bHK776dQy7A0hR55B5NOW/1U5iYHhNMNCw31Tct9Ula5Dt5U+oe69xMd5
-tog7UaESglsovusN65GpXjwsBUN/a4qYXXUEa3ZWhDsuH3b2ekcMRgfsx5QLSDqH
-5nFtX3kFAoGBAPLa4oBmLerzZ68GMU+uKQscN/C8o671UTS7jCbtWcBMUZOGrN3q
-+smpB0YB9W4kALSxYM4LsTQ4n8qkfJz1vlMu6iATcPnG+KlEhVITUHXB/ek5aWfZ
-N1uZDGUlg0sgWSlubnNs5xl6J8tYGRrk84g5i6QCSYxesoJ+M/1P7yozAoGBAMqK
-P/PYkbJWq/gh3KcrbbiQhjz6EoPlypcjBzdfQnPamJ94voh2YYNETlDXTSr5bATP
-+dooSaw6lkoDIzZg9IZrq9FDOwXjHptpakpIkYKXKxLVcBl6PrD/hv7jznawdLrP
-yWr9nkqIVHvJxMGvjg7ONgJhCuCHmecrO50p4sR/AoGAa/8aqq7FzK3hddvzIdP5
-PI+X8N5yi+Nb8W9VrBnwx6sou8owJZ/RVsxsB53nXstz5ObcfcSFUQu9Q4hSQhqm
-QKekRg9fNjRdcCiggRdFuJhEKer2DNBz5a/x6yj7cfU4sUwCoiHTw2inOa47u9IE
-2pd8mbrKqjmSeKVWyVc6rDECgYAlrp0BYByTQn7SNnKYA4NxYCopdBk3wuvzPIge
-LDHv3g6hNNS2DNhNlMrBTZ1EzozjRFJm3TH/whKuCHFnr5gu3h9kWo7DpKLQJUeq
-NGAmHLvd0CoAA3dgdNoH2BhUirXc/8WoizEFCuI0+bAKnP/gD0uLG8TrSy8+DBQW
-RHG1PwKBgBAsnnjH4KplKrzfMycTczHEM1pll/wWBe38TbA7YjrOYLGJkac0UVVQ
-Gqhoj3JfpSlWoUbMrOlyY7FlIptmj71P+xPNThKTcc42KMzYJCPhdMllXWktwWKo
-hQZsXUbv/2dzOsyQZWcWM/k+kVArS4+Q3eStBNxaDl0aNQC9CUUg
------END RSA PRIVATE KEY-----`
+type trackingReadCloser struct {
+	reader io.Reader
+	closed bool
+}
+
+func (body *trackingReadCloser) Read(p []byte) (int, error) {
+	return body.reader.Read(p)
+}
+
+func (body *trackingReadCloser) Close() error {
+	body.closed = true
+	return nil
+}
+
+type errReader struct {
+	err error
+}
+
+func (reader errReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
 
 func TestNewOAuthTokenRequest(t *testing.T) {
 	scenarios := []struct {
@@ -244,6 +240,161 @@ func TestExchangeOAuthToken(t *testing.T) {
 			}
 		}
 
+	}
+}
+
+func TestExchangeOAuthToken_ClosesResponseBodyOnStatusError(t *testing.T) {
+	body := &trackingReadCloser{reader: strings.NewReader(`{"error":"boom"}`)}
+	client := mockHTTPClient(func(req *http.Request) *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Status:     "500 Internal Server Error",
+			Body:       body,
+			Header:     make(http.Header),
+		}
+	})
+
+	request, err := http.NewRequest(http.MethodPost, "http://example.com/foo", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+
+	_, err = exchangeOAuthToken(request, client)
+	if err == nil {
+		t.Fatal("exchangeOAuthToken() error = nil, want non-nil")
+	}
+	if !body.closed {
+		t.Fatal("exchangeOAuthToken() did not close response body on status error")
+	}
+}
+
+func TestAuthRefreshTransport_RoundTripReturnsNilResponseOnInspectionError(t *testing.T) {
+	readErr := errors.New("read failure")
+	body := &trackingReadCloser{reader: errReader{err: readErr}}
+	transport := &authRefreshTransport{
+		session: &Session{},
+		base: roundTripFunc(func(req *http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Status:     "401 Unauthorized",
+				Body:       body,
+				Header:     make(http.Header),
+			}
+		}),
+	}
+
+	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+	request.Header.Set("Authorization", "Bearer expired")
+
+	response, err := transport.RoundTrip(request)
+	if err == nil {
+		t.Fatal("RoundTrip() error = nil, want non-nil")
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("RoundTrip() error = %v, want %v", err, readErr)
+	}
+	if response != nil {
+		t.Fatalf("RoundTrip() response = %#v, want nil", response)
+	}
+	if !body.closed {
+		t.Fatal("RoundTrip() did not close response body on inspection error")
+	}
+}
+
+func TestSessionRefresh_DoesNotBlockAuthorizationHeader(t *testing.T) {
+	passwordCreds, err := credentials.NewPasswordCredentials(credentials.PasswordCredentials{
+		URL:          "https://login.salesforce.example.com",
+		Username:     "myusername",
+		Password:     "12345",
+		ClientID:     "some client id",
+		ClientSecret: "shhhh its a secret",
+	})
+	if err != nil {
+		t.Fatalf("credentials.NewPasswordCredentials() error = %v, want nil", err)
+	}
+
+	authStarted := make(chan struct{})
+	releaseAuth := make(chan struct{})
+	refreshDone := make(chan error, 1)
+	client := mockHTTPClient(func(req *http.Request) *http.Response {
+		if req.URL.Path != oauthEndpoint {
+			t.Fatalf("unexpected request path %q", req.URL.Path)
+		}
+		close(authStarted)
+		<-releaseAuth
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body: ioutil.NopCloser(strings.NewReader(`{
+				"access_token": "refreshed",
+				"instance_url": "https://instance.salesforce.example.com",
+				"id": "https://test.salesforce.com/id/123456789",
+				"token_type": "Bearer",
+				"issued_at": "1553568410028",
+				"signature": "hello"
+			}`)),
+			Header: make(http.Header),
+		}
+	})
+
+	session := &Session{
+		response: &oauthTokenResponse{
+			AccessToken: "expired",
+			InstanceURL: "https://instance.salesforce.example.com",
+			ID:          "https://test.salesforce.com/id/123456789",
+			TokenType:   "Bearer",
+			IssuedAt:    "1553568410028",
+			Signature:   "hello",
+		},
+		config: sfdc.Configuration{
+			Credentials: passwordCreds,
+			Client:      client,
+			Version:     45,
+		},
+	}
+
+	go func() {
+		refreshDone <- session.refresh("Bearer expired")
+	}()
+
+	<-authStarted
+
+	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+
+	authHeaderDone := make(chan struct{})
+	go func() {
+		session.AuthorizationHeader(request)
+		close(authHeaderDone)
+	}()
+
+	select {
+	case <-authHeaderDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("AuthorizationHeader blocked while refresh was in flight")
+	}
+
+	if got, want := request.Header.Get("Authorization"), "Bearer expired"; got != want {
+		t.Fatalf("AuthorizationHeader() = %q, want %q while refresh is in flight", got, want)
+	}
+
+	close(releaseAuth)
+
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refresh() error = %v, want nil", err)
+	}
+
+	nextRequest, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v, want nil", err)
+	}
+	session.AuthorizationHeader(nextRequest)
+	if got, want := nextRequest.Header.Get("Authorization"), "Bearer refreshed"; got != want {
+		t.Fatalf("AuthorizationHeader() = %q, want %q after refresh completes", got, want)
 	}
 }
 
@@ -679,16 +830,11 @@ func TestSession_ClientReauthenticatesAfterInvalidAuthErrors(t *testing.T) {
 }
 
 func TestSession_ClientReauthenticatesWithJWTCredentials(t *testing.T) {
-	signKey, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(jwtTestPrivateKey))
-	if err != nil {
-		t.Fatalf("jwt.ParseRSAPrivateKeyFromPEM() error = %v, want nil", err)
-	}
-
 	jwtCreds, err := credentials.NewJWTCredentials(credentials.JwtCredentials{
 		URL:            "https://login.salesforce.example.com",
 		ClientId:       "some client id",
 		ClientUsername: "myusername",
-		ClientKey:      signKey,
+		ClientKey:      testkeys.MustParseRSAPrivateKey(t),
 	})
 	if err != nil {
 		t.Fatalf("credentials.NewJWTCredentials() error = %v, want nil", err)

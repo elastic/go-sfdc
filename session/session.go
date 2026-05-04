@@ -17,10 +17,11 @@ import (
 // Session is the authentication response. This is used to generate the
 // authorization header for the Salesforce API calls.
 type Session struct {
-	response *oauthTokenResponse
-	config   sfdc.Configuration
-	client   *http.Client
-	mu       sync.RWMutex
+	response  *oauthTokenResponse
+	config    sfdc.Configuration
+	client    *http.Client
+	mu        sync.RWMutex
+	refreshMu sync.Mutex
 }
 
 // Clienter interface provides the HTTP client used by the
@@ -131,12 +132,12 @@ func exchangeOAuthToken(request *http.Request, client *http.Client) (*oauthToken
 	if err != nil {
 		return nil, err
 	}
+	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("session response error: %d %s", response.StatusCode, response.Status)
 	}
 	decoder := json.NewDecoder(response.Body)
-	defer response.Body.Close()
 
 	var token oauthTokenResponse
 	err = decoder.Decode(&token)
@@ -185,11 +186,10 @@ func (session *Session) authorizationValue() string {
 }
 
 func (session *Session) refresh(failedAuthorization string) error {
-	session.mu.Lock()
-	defer session.mu.Unlock()
+	session.refreshMu.Lock()
+	defer session.refreshMu.Unlock()
 
-	currentAuthorization := fmt.Sprintf("%s %s", session.response.TokenType, session.response.AccessToken)
-	if failedAuthorization != "" && currentAuthorization != failedAuthorization {
+	if failedAuthorization != "" && session.authorizationValue() != failedAuthorization {
 		return nil
 	}
 
@@ -203,7 +203,9 @@ func (session *Session) refresh(failedAuthorization string) error {
 		return err
 	}
 
+	session.mu.Lock()
 	session.response = response
+	session.mu.Unlock()
 	return nil
 }
 
@@ -240,13 +242,22 @@ func (transport *authRefreshTransport) RoundTrip(request *http.Request) (*http.R
 	}
 
 	response, err := transport.base.RoundTrip(request)
-	if err != nil || retryRequest == nil {
-		return response, err
+	if err != nil {
+		return nil, err
+	}
+	if retryRequest == nil {
+		return response, nil
 	}
 
 	invalidAuth, err := isInvalidAuthResponse(response)
-	if err != nil || !invalidAuth {
-		return response, err
+	if err != nil {
+		if response.Body != nil {
+			response.Body.Close()
+		}
+		return nil, err
+	}
+	if !invalidAuth {
+		return response, nil
 	}
 
 	if err := transport.session.refresh(failedAuthorization); err != nil {
@@ -268,6 +279,7 @@ func isInvalidAuthResponse(response *http.Response) (bool, error) {
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
+		response.Body.Close()
 		return false, err
 	}
 	response.Body.Close()
