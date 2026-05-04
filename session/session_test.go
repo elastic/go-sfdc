@@ -516,110 +516,134 @@ func TestSession_InstanceURL(t *testing.T) {
 	}
 }
 
-func TestSession_ClientReauthenticatesAfterInvalidAuthHeader(t *testing.T) {
-	passwordCreds, err := credentials.NewPasswordCredentials(credentials.PasswordCredentials{
-		URL:          "https://login.salesforce.example.com",
-		Username:     "myusername",
-		Password:     "12345",
-		ClientID:     "some client id",
-		ClientSecret: "shhhh its a secret",
-	})
-	if err != nil {
-		t.Fatalf("credentials.NewPasswordCredentials() error = %v, want nil", err)
+func TestSession_ClientReauthenticatesAfterInvalidAuthErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		status     string
+		errorCode  string
+	}{
+		{
+			name:       "invalid auth header",
+			statusCode: http.StatusBadRequest,
+			status:     "400 Bad Request",
+			errorCode:  "INVALID_AUTH_HEADER",
+		},
+		{
+			name:       "invalid session id",
+			statusCode: http.StatusUnauthorized,
+			status:     "401 Unauthorized",
+			errorCode:  "INVALID_SESSION_ID",
+		},
 	}
 
-	authCalls := 0
-	resourceCalls := 0
-	var authHeaders []string
-
-	client := mockHTTPClient(func(req *http.Request) *http.Response {
-		switch req.URL.Path {
-		case oauthEndpoint:
-			authCalls++
-			token := "expired"
-			if authCalls > 1 {
-				token = "refreshed"
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			passwordCreds, err := credentials.NewPasswordCredentials(credentials.PasswordCredentials{
+				URL:          "https://login.salesforce.example.com",
+				Username:     "myusername",
+				Password:     "12345",
+				ClientID:     "some client id",
+				ClientSecret: "shhhh its a secret",
+			})
+			if err != nil {
+				t.Fatalf("credentials.NewPasswordCredentials() error = %v, want nil", err)
 			}
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`{
-					"access_token": %q,
-					"instance_url": "https://instance.salesforce.example.com",
-					"id": "https://test.salesforce.com/id/123456789",
-					"token_type": "Bearer",
-					"issued_at": "1553568410028",
-					"signature": "hello"
-				}`, token))),
-				Header: make(http.Header),
-			}
-		case "/resource":
-			resourceCalls++
-			authHeaders = append(authHeaders, req.Header.Get("Authorization"))
-			if resourceCalls == 1 {
-				return &http.Response{
-					StatusCode: http.StatusBadRequest,
-					Status:     "400 Bad Request",
-					Body: ioutil.NopCloser(strings.NewReader(`[{
-						"message": "Session expired or invalid",
-						"errorCode": "INVALID_AUTH_HEADER"
-					}]`)),
-					Header: make(http.Header),
+			authCalls := 0
+			resourceCalls := 0
+			var authHeaders []string
+
+			client := mockHTTPClient(func(req *http.Request) *http.Response {
+				switch req.URL.Path {
+				case oauthEndpoint:
+					authCalls++
+					token := "expired"
+					if authCalls > 1 {
+						token = "refreshed"
+					}
+
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`{
+							"access_token": %q,
+							"instance_url": "https://instance.salesforce.example.com",
+							"id": "https://test.salesforce.com/id/123456789",
+							"token_type": "Bearer",
+							"issued_at": "1553568410028",
+							"signature": "hello"
+						}`, token))),
+						Header: make(http.Header),
+					}
+				case "/resource":
+					resourceCalls++
+					authHeaders = append(authHeaders, req.Header.Get("Authorization"))
+					if resourceCalls == 1 {
+						return &http.Response{
+							StatusCode: tt.statusCode,
+							Status:     tt.status,
+							Body: ioutil.NopCloser(strings.NewReader(fmt.Sprintf(`[{
+								"message": "Session expired or invalid",
+								"errorCode": %q
+							}]`, tt.errorCode))),
+							Header: make(http.Header),
+						}
+					}
+
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Status:     "200 OK",
+						Body:       ioutil.NopCloser(strings.NewReader(`{}`)),
+						Header:     make(http.Header),
+					}
+				default:
+					t.Fatalf("unexpected request path %q", req.URL.Path)
+					return nil
 				}
+			})
+
+			session, err := Open(sfdc.Configuration{
+				Credentials: passwordCreds,
+				Client:      client,
+				Version:     45,
+			})
+			if err != nil {
+				t.Fatalf("Open() error = %v, want nil", err)
 			}
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Status:     "200 OK",
-				Body:       ioutil.NopCloser(strings.NewReader(`{}`)),
-				Header:     make(http.Header),
+			request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest() error = %v, want nil", err)
 			}
-		default:
-			t.Fatalf("unexpected request path %q", req.URL.Path)
-			return nil
-		}
-	})
+			session.AuthorizationHeader(request)
 
-	session, err := Open(sfdc.Configuration{
-		Credentials: passwordCreds,
-		Client:      client,
-		Version:     45,
-	})
-	if err != nil {
-		t.Fatalf("Open() error = %v, want nil", err)
-	}
+			response, err := session.Client().Do(request)
+			if err != nil {
+				t.Fatalf("Session.Client().Do() error = %v, want nil", err)
+			}
+			defer response.Body.Close()
 
-	request, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
-	if err != nil {
-		t.Fatalf("http.NewRequest() error = %v, want nil", err)
-	}
-	session.AuthorizationHeader(request)
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("Session.Client().Do() status = %d, want %d", response.StatusCode, http.StatusOK)
+			}
+			if authCalls != 2 {
+				t.Fatalf("auth calls = %d, want 2", authCalls)
+			}
+			if resourceCalls != 2 {
+				t.Fatalf("resource calls = %d, want 2", resourceCalls)
+			}
+			if !reflect.DeepEqual(authHeaders, []string{"Bearer expired", "Bearer refreshed"}) {
+				t.Fatalf("authorization headers = %v, want %v", authHeaders, []string{"Bearer expired", "Bearer refreshed"})
+			}
 
-	response, err := session.Client().Do(request)
-	if err != nil {
-		t.Fatalf("Session.Client().Do() error = %v, want nil", err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("Session.Client().Do() status = %d, want %d", response.StatusCode, http.StatusOK)
-	}
-	if authCalls != 2 {
-		t.Fatalf("auth calls = %d, want 2", authCalls)
-	}
-	if resourceCalls != 2 {
-		t.Fatalf("resource calls = %d, want 2", resourceCalls)
-	}
-	if !reflect.DeepEqual(authHeaders, []string{"Bearer expired", "Bearer refreshed"}) {
-		t.Fatalf("authorization headers = %v, want %v", authHeaders, []string{"Bearer expired", "Bearer refreshed"})
-	}
-
-	nextRequest, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
-	if err != nil {
-		t.Fatalf("http.NewRequest() error = %v, want nil", err)
-	}
-	session.AuthorizationHeader(nextRequest)
-	if got, want := nextRequest.Header.Get("Authorization"), "Bearer refreshed"; got != want {
-		t.Fatalf("Session.AuthorizationHeader() = %q, want %q", got, want)
+			nextRequest, err := http.NewRequest(http.MethodGet, "https://instance.salesforce.example.com/resource", nil)
+			if err != nil {
+				t.Fatalf("http.NewRequest() error = %v, want nil", err)
+			}
+			session.AuthorizationHeader(nextRequest)
+			if got, want := nextRequest.Header.Get("Authorization"), "Bearer refreshed"; got != want {
+				t.Fatalf("Session.AuthorizationHeader() = %q, want %q", got, want)
+			}
+		})
 	}
 }
